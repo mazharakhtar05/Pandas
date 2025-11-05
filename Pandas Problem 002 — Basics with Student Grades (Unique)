@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 002 — Basics with Student Grades (Unique)
+
+You are given a students' exam dataset with columns:
+- student_id (str like S0001)
+- name (str)
+- class (str: "FY", "SY", "TY")
+- math (int/float, may have missing)
+- physics (int/float, may have missing)
+- chemistry (int/float, may have missing)
+- section (str like A/B/C)
+- exam_date (str ISO date)
+Some numeric columns may be read as strings and need conversion.
+
+Tasks (BASICS)
+1) Load & Inspect:
+   - Create a synthetic CSV `./data/students_grades.csv`.
+   - Read it with pandas, show shape, head(3), dtypes.
+   - Convert math/physics/chemistry to numeric (coerce errors).
+
+2) Basic Cleaning:
+   - Report missing count per subject.
+   - Fill missing subject scores with the subject column mean (rounded to 1 decimal).
+
+3) New Columns:
+   - total = math + physics + chemistry
+   - average = total / 3 (round to 2 decimals)
+   - passed = average >= 40 (boolean)
+
+4) Selections & Filtering:
+   - Show top 5 students by total (columns: student_id, name, class, total).
+   - Filter FY class students with average >= 60 (show 5 rows).
+
+5) Sorting & Value Counts:
+   - Sort entire DataFrame by [class asc, section asc, average desc] and show head(8).
+   - Show count of students per class (value_counts, as a DataFrame).
+
+6) Groupby (Intro):
+   - Compute mean average per class (one row per class).
+   - Compute mean of each subject per section (A/B/C).
+
+7) Binning (Intro):
+   - Make grade_band from average using pd.cut:
+     <40: "F", 40–59.99: "C", 60–74.99: "B", 75–100: "A"
+   - Show frequency of grade_band.
+
+8) Save Artifacts:
+   - Save cleaned full table to ./artifacts/students_grades_clean.csv
+   - Save:
+       - top5_by_total.csv
+       - fy_avg60.csv
+       - mean_avg_by_class.csv
+       - mean_subjects_by_section.csv
+       - grade_band_counts.csv
+
+Run:
+    python pandas_002_basics_students.py
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Data generation (synthetic)
+# -----------------------------
+def generate_students_csv(path: Path, seed: int = 11, n: int = 120) -> None:
+    rng = np.random.default_rng(seed)
+    classes = ["FY", "SY", "TY"]
+    sections = ["A", "B", "C"]
+
+    # Names pool (simple)
+    first = ["Aarav", "Vivaan", "Aditya", "Arjun", "Ishaan", "Kabir", "Reyansh", "Om", "Rohan", "Atharv",
+             "Ananya", "Diya", "Ira", "Kiara", "Myra", "Navya", "Riya", "Saanvi", "Sara", "Tara"]
+    last = ["Sharma", "Gupta", "Verma", "Singh", "Yadav", "Tiwari", "Mishra", "Agarwal", "Khan", "Patel"]
+
+    def any_name():
+        return f"{rng.choice(first)} {rng.choice(last)}"
+
+    # Random base marks with some skew and occasional strings
+    math = rng.normal(58, 18, n).round(1)
+    physics = rng.normal(55, 20, n).round(1)
+    chemistry = rng.normal(60, 17, n).round(1)
+
+    # clamp to [0, 100]
+    math = np.clip(math, 0, 100)
+    physics = np.clip(physics, 0, 100)
+    chemistry = np.clip(chemistry, 0, 100)
+
+    # introduce missing values
+    miss_m = rng.random(n) < 0.08
+    miss_p = rng.random(n) < 0.07
+    miss_c = rng.random(n) < 0.06
+    math[miss_m] = np.nan
+    physics[miss_p] = np.nan
+    chemistry[miss_c] = np.nan
+
+    # randomly convert some numbers to strings to test to_numeric
+    as_str_idx = rng.choice(np.arange(n), size=int(n * 0.1), replace=False)
+    math_str = math.astype(object)
+    physics_str = physics.astype(object)
+    chemistry_str = chemistry.astype(object)
+    for i in as_str_idx:
+        # toss in some stray whitespace or comma
+        val = math_str[i]
+        if not pd.isna(val):
+            math_str[i] = f" {val}"
+        val = physics_str[i]
+        if not pd.isna(val):
+            physics_str[i] = f"{val},"
+        val = chemistry_str[i]
+        if not pd.isna(val):
+            chemistry_str[i] = f"{val} "
+
+    exam_dates = pd.date_range("2024-11-01", periods=40, freq="D")
+    df = pd.DataFrame(
+        {
+            "student_id": [f"S{str(i).zfill(4)}" for i in range(1, n + 1)],
+            "name": [any_name() for _ in range(n)],
+            "class": rng.choice(classes, size=n, p=[0.4, 0.35, 0.25]),
+            "section": rng.choice(sections, size=n, p=[0.35, 0.4, 0.25]),
+            "math": math_str,
+            "physics": physics_str,
+            "chemistry": chemistry_str,
+            "exam_date": rng.choice(exam_dates, size=n).astype(str),
+        }
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"Wrote {path} with {len(df)} rows")
+
+
+# -----------------------------
+# Solutions (BASICS)
+# -----------------------------
+def main() -> None:
+    data_path = Path("data/students_grades.csv")
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    # 1) Generate & Read
+    if not data_path.exists():
+        generate_students_csv(data_path)
+
+    print("\n=== 1) LOAD & INSPECT ===")
+    df = pd.read_csv(data_path, dtype={"student_id": str, "name": str, "class": str, "section": str, "exam_date": str})
+    print("Shape:", df.shape)
+    print("Head(3):")
+    print(df.head(3).to_string(index=False))
+    print("\nDtypes before cleaning:\n", df.dtypes)
+
+    # Convert numeric columns to numeric (coerce)
+    for col in ["math", "physics", "chemistry"]:
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace({"nan": np.nan})
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    print("\nDtypes after to_numeric:\n", df.dtypes)
+
+    # 2) Basic Cleaning
+    print("\n=== 2) MISSING COUNTS & IMPUTATION ===")
+    missing = df[["math", "physics", "chemistry"]].isna().sum()
+    print("Missing counts:\n", missing.to_string())
+
+    for col in ["math", "physics", "chemistry"]:
+        mean_val = round(df[col].mean(skipna=True), 1)
+        df[col] = df[col].fillna(mean_val)
+
+    # 3) New Columns
+    df["total"] = df["math"] + df["physics"] + df["chemistry"]
+    df["average"] = (df["total"] / 3).round(2)
+    df["passed"] = df["average"] >= 40
+
+    # 4) Selections & Filtering
+    print("\n=== 4) SELECTIONS & FILTERING ===")
+    top5_by_total = df[["student_id", "name", "class", "total"]].sort_values("total", ascending=False).head(5)
+    print("Top 5 by total:\n", top5_by_total.to_string(index=False))
+
+    fy_avg60 = df.loc[(df["class"] == "FY") & (df["average"] >= 60), ["student_id", "name", "average", "section"]].head(5)
+    print("\nFY students with average >= 60 (sample 5):\n", fy_avg60.to_string(index=False))
+
+    # 5) Sorting & Value Counts
+    print("\n=== 5) SORTING & VALUE COUNTS ===")
+    sorted_view = df.sort_values(by=["class", "section", "average"], ascending=[True, True, False]).head(8)
+    print("Sorted by class, section, average (head 8):\n", sorted_view[["student_id", "class", "section", "average"]].to_string(index=False))
+
+    class_counts = df["class"].value_counts().rename_axis("class").reset_index(name="count")
+    print("\nStudents per class:\n", class_counts.to_string(index=False))
+
+    # 6) Groupby (Intro)
+    print("\n=== 6) GROUPBY INTRO ===")
+    mean_avg_by_class = df.groupby("class", as_index=False)["average"].mean().rename(columns={"average": "mean_average"})
+    print("Mean average by class:\n", mean_avg_by_class.to_string(index=False))
+
+    mean_subjects_by_section = df.groupby("section", as_index=False)[["math", "physics", "chemistry"]].mean().round(2)
+    print("\nMean subjects by section:\n", mean_subjects_by_section.to_string(index=False))
+
+    # 7) Binning (Intro)
+    print("\n=== 7) BINS / GRADE BANDS ===")
+    bins = [-0.1, 40, 60, 75, 100]
+    labels = ["F", "C", "B", "A"]
+    df["grade_band"] = pd.cut(df["average"], bins=bins, labels=labels, include_lowest=True, right=False)
+    grade_band_counts = df["grade_band"].value_counts().rename_axis("grade_band").reset_index(name="count").sort_values("grade_band")
+    print("Grade band counts:\n", grade_band_counts.to_string(index=False))
+
+    # 8) Save Artifacts
+    out_clean = artifacts / "students_grades_clean.csv"
+    out_top5 = artifacts / "top5_by_total.csv"
+    out_fy = artifacts / "fy_avg60.csv"
+    out_mean_class = artifacts / "mean_avg_by_class.csv"
+    out_mean_section = artifacts / "mean_subjects_by_section.csv"
+    out_grade_counts = artifacts / "grade_band_counts.csv"
+
+    df.to_csv(out_clean, index=False)
+    top5_by_total.to_csv(out_top5, index=False)
+    fy_avg60.to_csv(out_fy, index=False)
+    mean_avg_by_class.to_csv(out_mean_class, index=False)
+    mean_subjects_by_section.to_csv(out_mean_section, index=False)
+    grade_band_counts.to_csv(out_grade_counts, index=False)
+
+    # Sanity checks (basic)
+    assert df["math"].isna().sum() == 0
+    assert df["physics"].isna().sum() == 0
+    assert df["chemistry"].isna().sum() == 0
+    assert df["average"].between(0, 100).all()
+
+    print("\nSaved cleaned table and summaries to ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
