@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 002 — Channel Mix, Pivot, and Rolling Stats (Unique)
+
+You are given an e-commerce orders dataset with columns:
+- order_id (int, unique)
+- order_date (datetime)
+- customer_id (str)
+- city (categorical)
+- channel (categorical; e.g., 'Website', 'Android', 'iOS', 'WhatsApp')
+- items (int)
+- price (float; price per item)
+
+Define revenue = items * price.
+
+Tasks
+1) Daily Revenue:
+   Compute daily total revenue (one row per date).
+
+2) Monthly Channel Mix:
+   For each month, compute revenue by channel and its share (%) of that month’s total.
+   Output columns: [month, channel, revenue, share_pct].
+
+3) City Top Channels (Last 60 Days):
+   Consider only the most recent 60 days in the data. For each city,
+   find the top-2 channels by revenue (rank 1 & 2).
+   Output columns: [city, channel, revenue_60d, rank].
+
+4) Monthly Pivot:
+   Create a pivot table of revenue with months as rows and channels as columns.
+   Fill missing with 0 and sort rows ascending by month.
+
+5) Rolling 3-Month Average (per Channel):
+   On the monthly pivot, compute a rolling 3-month average for each channel
+   (center=False, min_periods=1). Save as a separate table.
+
+Deliverables when this script runs:
+- Prints small samples of each result.
+- Saves CSVs into ./artifacts:
+  - daily_revenue.csv
+  - monthly_channel_mix.csv
+  - city_top_channels_60d.csv
+  - monthly_pivot_revenue.csv
+  - monthly_pivot_revenue_rolling3.csv
+
+This file includes dataset generation, solution, and basic sanity checks.
+It’s fully standalone — just run:
+    python pandas_002_channel_mix.py
+"""
+
+from __future__ import annotations
+
+import os
+from datetime import timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Data generation (synthetic)
+# -----------------------------
+def generate_orders(seed: int = 7) -> pd.DataFrame:
+    """
+    Generate a synthetic orders dataset across ~9 months with some realistic variation.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Timeline: ~9 months starting from 2024-09-01
+    start = pd.Timestamp("2024-09-01")
+    days = 270
+    dates = pd.date_range(start, periods=days, freq="D")
+
+    n = 12000  # number of orders
+    order_ids = np.arange(10_000, 10_000 + n)
+    order_dates = rng.choice(dates, size=n, replace=True)
+
+    cities = ["Kanpur", "Lucknow", "Delhi", "Noida", "Varanasi", "Agra"]
+    channels = ["Website", "Android", "iOS", "WhatsApp"]
+
+    customer_ids = [f"C{str(i).zfill(5)}" for i in rng.integers(1, 5000, size=n)]
+    city_col = rng.choice(cities, size=n, p=[0.22, 0.18, 0.26, 0.14, 0.12, 0.08])
+    channel_col = rng.choice(channels, size=n, p=[0.38, 0.32, 0.20, 0.10])
+
+    # items & price with some seasonality/noise
+    base_items = rng.integers(1, 5, size=n)
+    base_price = rng.normal(450.0, 90.0, size=n)  # per item
+
+    # Add a small uplift for Delhi/iOS to make the ranking interesting
+    city_uplift = np.where(city_col == "Delhi", 1.12, 1.0)
+    ios_uplift = np.where(channel_col == "iOS", 1.08, 1.0)
+
+    # Weekend effect: slightly higher items on Sat/Sun
+    dow = pd.to_datetime(order_dates).dayofweek  # Mon=0
+    weekend_boost = np.where(dow >= 5, 1.15, 1.0)
+
+    items = np.clip((base_items * weekend_boost).round().astype(int), 1, None)
+    price = (base_price * city_uplift * ios_uplift).clip(150, 1200).round(2)
+
+    df = pd.DataFrame(
+        {
+            "order_id": order_ids,
+            "order_date": pd.to_datetime(order_dates),
+            "customer_id": customer_ids,
+            "city": city_col,
+            "channel": channel_col,
+            "items": items,
+            "price": price,
+        }
+    )
+    return df
+
+
+# -----------------------------
+# Solutions
+# -----------------------------
+def solve_daily_revenue(df: pd.DataFrame) -> pd.DataFrame:
+    daily = (
+        df.assign(revenue=df["items"] * df["price"])
+        .groupby(df["order_date"].dt.date, as_index=False)["revenue"]
+        .sum()
+        .rename(columns={"order_date": "date"})
+    )
+    daily["date"] = pd.to_datetime(daily["date"])
+    return daily.sort_values("date")
+
+
+def solve_monthly_channel_mix(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp["month"] = tmp["order_date"].dt.to_period("M").dt.to_timestamp()
+    tmp["revenue"] = tmp["items"] * tmp["price"]
+
+    monthly = (
+        tmp.groupby(["month", "channel"], as_index=False)["revenue"]
+        .sum()
+        .sort_values(["month", "channel"])
+    )
+    totals = monthly.groupby("month", as_index=False)["revenue"].sum().rename(
+        columns={"revenue": "month_total"}
+    )
+    out = monthly.merge(totals, on="month", how="left")
+    out["share_pct"] = (out["revenue"] / out["month_total"] * 100).round(2)
+    return out[["month", "channel", "revenue", "share_pct"]]
+
+
+def solve_city_top_channels_60d(df: pd.DataFrame) -> pd.DataFrame:
+    max_day = df["order_date"].max().normalize()
+    cutoff = max_day - timedelta(days=59)  # inclusive 60 days window
+    recent = df[df["order_date"] >= cutoff].copy()
+    recent["revenue"] = recent["items"] * recent["price"]
+
+    ranked = (
+        recent.groupby(["city", "channel"], as_index=False)["revenue"]
+        .sum()
+        .rename(columns={"revenue": "revenue_60d"})
+    )
+    ranked["rank"] = ranked.groupby("city")["revenue_60d"].rank(
+        method="dense", ascending=False
+    )
+    top2 = ranked.query("rank <= 2").sort_values(["city", "rank", "revenue_60d"], ascending=[True, True, False])
+    # Make rank integer
+    top2["rank"] = top2["rank"].astype(int)
+    return top2
+
+
+def solve_monthly_pivot(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp["month"] = tmp["order_date"].dt.to_period("M").dt.to_timestamp()
+    tmp["revenue"] = tmp["items"] * tmp["price"]
+
+    pivot = (
+        tmp.pivot_table(
+            index="month",
+            columns="channel",
+            values="revenue",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .sort_index()
+        .astype(float)
+    )
+    # Make columns simple (no MultiIndex)
+    pivot.columns.name = None
+    return pivot.reset_index()
+
+
+def solve_monthly_pivot_rolling3(pivot_df: pd.DataFrame) -> pd.DataFrame:
+    pivot = pivot_df.set_index("month").sort_index()
+    # Apply rolling per column; min_periods=1 to get early months too
+    rolled = pivot.rolling(window=3, min_periods=1).mean()
+    return rolled.reset_index()
+
+
+# -----------------------------
+# CLI / Runner
+# -----------------------------
+def main() -> None:
+    print("Generating synthetic orders dataset...")
+    df = generate_orders(seed=7)
+
+    # Basic sanity
+    assert {"order_id", "order_date", "customer_id", "city", "channel", "items", "price"}.issubset(df.columns)
+    assert df["items"].min() >= 1
+    assert df["price"].min() >= 150
+
+    # Solve tasks
+    print("Solving Task 1: Daily Revenue")
+    daily = solve_daily_revenue(df)
+
+    print("Solving Task 2: Monthly Channel Mix")
+    monthly_mix = solve_monthly_channel_mix(df)
+
+    print("Solving Task 3: City Top Channels (Last 60 Days)")
+    top2 = solve_city_top_channels_60d(df)
+
+    print("Solving Task 4: Monthly Pivot")
+    monthly_pivot = solve_monthly_pivot(df)
+
+    print("Solving Task 5: Rolling 3-Month Averages on Pivot")
+    rolling3 = solve_monthly_pivot_rolling3(monthly_pivot)
+
+    # Show small samples
+    print("\n=== SAMPLE OUTPUTS ===")
+    print("\nDaily Revenue (head):")
+    print(daily.head(5).to_string(index=False))
+
+    print("\nMonthly Channel Mix (head):")
+    print(monthly_mix.head(8).to_string(index=False))
+
+    print("\nCity Top Channels — Last 60 Days (all rows):")
+    print(top2.to_string(index=False))
+
+    print("\nMonthly Pivot Revenue (head):")
+    print(monthly_pivot.head(6).to_string(index=False))
+
+    print("\nMonthly Pivot Rolling(3) (head):")
+    print(rolling3.head(6).to_string(index=False))
+
+    # Save artifacts
+    outdir = Path("artifacts")
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    daily.to_csv(outdir / "daily_revenue.csv", index=False)
+    monthly_mix.to_csv(outdir / "monthly_channel_mix.csv", index=False)
+    top2.to_csv(outdir / "city_top_channels_60d.csv", index=False)
+    monthly_pivot.to_csv(outdir / "monthly_pivot_revenue.csv", index=False)
+    rolling3.to_csv(outdir / "monthly_pivot_revenue_rolling3.csv", index=False)
+
+    # Extra checks
+    assert not monthly_mix.empty
+    assert not monthly_pivot.empty
+    # Share should be ~100 per month (floating tolerance)
+    shares = monthly_mix.groupby("month")["share_pct"].sum().round(0)
+    assert shares.between(99, 101).all(), "Monthly shares should sum to ~100%"
+
+    print("\nSaved CSVs to ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
