@@ -37,4 +37,134 @@ Tasks (BASICS)
    - Clean merged table → ./artifacts/sales_clean.csv
    - Category revenue summary → ./artifacts/category_revenue.csv
    - Monthly average revenue → ./artifacts/monthly_avg_revenue.csv
-   - Pivot → ./artifa
+   - Pivot → ./artifacts/sales_pivot.csv
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+
+# -----------------------------
+# Data Generation
+# -----------------------------
+def generate_data(seed: int = 42) -> None:
+    rng = np.random.default_rng(seed)
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # products
+    products = pd.DataFrame({
+        "product_id": np.arange(101, 111),
+        "product_name": [
+            "Keyboard", "Mouse", "Monitor", "Laptop", "Tablet",
+            "Phone", "Charger", "Earphones", "Speaker", "Webcam"
+        ],
+        "category": rng.choice(
+            ["Electronics", "Accessories", "Computing"],
+            size=10, p=[0.4, 0.3, 0.3]
+        )
+    })
+    products.to_csv(data_dir / "products.csv", index=False)
+
+    # sales
+    n = 80
+    sale_ids = np.arange(5001, 5001 + n)
+    product_ids = rng.choice(products["product_id"], size=n)
+    dates = pd.date_range("2024-09-01", periods=60).to_list()
+    sale_dates = rng.choice(dates, size=n)
+    quantity = rng.integers(1, 6, size=n)
+    unit_price = rng.normal(1500, 400, size=n).round(2).clip(200, 4000)
+
+    sales = pd.DataFrame({
+        "sale_id": sale_ids,
+        "product_id": product_ids,
+        "date": pd.to_datetime(sale_dates),
+        "quantity": quantity,
+        "unit_price": unit_price
+    })
+    sales.to_csv(data_dir / "sales.csv", index=False)
+    print("Generated data in ./data/")
+
+
+# -----------------------------
+# Solution
+# -----------------------------
+def main() -> None:
+    data_dir = Path("data")
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    if not (data_dir / "sales.csv").exists():
+        generate_data()
+
+    # 1) Load
+    sales = pd.read_csv(data_dir / "sales.csv", parse_dates=["date"])
+    products = pd.read_csv(data_dir / "products.csv")
+
+    print("\n=== 1) BASIC INSPECTION ===")
+    print("Shape:", sales.shape)
+    print(sales.head(3).to_string(index=False))
+    print("\nInfo:")
+    print(sales.info())
+
+    # 2) Rename columns
+    sales.columns = [col.title().replace("_", " ") for col in sales.columns]
+    products.columns = [col.title().replace("_", " ") for col in products.columns]
+
+    # 3) Indexing & Selection
+    print("\n=== 3) INDEXING & SELECTION ===")
+    sales = sales.set_index("Sale Id")
+    print("Head with selected cols:\n", sales[["Product Id", "Quantity"]].head().to_string())
+    sales.reset_index(inplace=True)
+
+    # 4) Derived Columns
+    print("\n=== 4) DERIVED COLUMNS ===")
+    sales["Revenue"] = sales["Quantity"] * sales["Unit Price"]
+    sales["Month"] = sales["Date"].dt.month_name().str[:3]
+    print(sales[["Date", "Quantity", "Unit Price", "Revenue", "Month"]].head(5).to_string(index=False))
+
+    # 5) Merge
+    print("\n=== 5) MERGE WITH PRODUCTS ===")
+    merged = pd.merge(sales, products, on="Product Id", how="left")
+    merged = merged[["Date", "Product Name", "Category", "Quantity", "Unit Price", "Revenue", "Month"]]
+    print(merged.head(3).to_string(index=False))
+
+    # 6) Grouping
+    print("\n=== 6) GROUPING ===")
+    cat_revenue = merged.groupby("Category", as_index=False)["Revenue"].sum().sort_values("Revenue", ascending=False)
+    print("Revenue by category:\n", cat_revenue.to_string(index=False))
+
+    monthly_avg = merged.groupby("Month", as_index=False)["Revenue"].mean().sort_values("Month")
+    print("\nAverage revenue by month:\n", monthly_avg.to_string(index=False))
+
+    # 7) Sorting
+    print("\n=== 7) SORTING ===")
+    top5 = merged.sort_values("Revenue", ascending=False).head(5)
+    print("Top 5 by revenue:\n", top5.to_string(index=False))
+
+    # 8) Pivot
+    print("\n=== 8) PIVOT ===")
+    pivot = merged.pivot_table(
+        index="Category",
+        columns="Month",
+        values="Revenue",
+        aggfunc="sum",
+        fill_value=0.0
+    ).round(2)
+    pivot.columns.name = None
+    print(pivot.head().to_string())
+
+    # 9) Save
+    merged.to_csv(artifacts / "sales_clean.csv", index=False)
+    cat_revenue.to_csv(artifacts / "category_revenue.csv", index=False)
+    monthly_avg.to_csv(artifacts / "monthly_avg_revenue.csv", index=False)
+    pivot.to_csv(artifacts / "sales_pivot.csv")
+
+    print("\nArtifacts saved in ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
