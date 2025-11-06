@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 004 — Basics of Concatenation, Cleaning, and Simple Stats (Unique)
+
+Dataset Description
+--------------------
+You are given two CSV files representing customer data collected from
+two different branches of the same company:
+
+1) customers_branchA.csv
+2) customers_branchB.csv
+
+Each contains:
+- cust_id (string like C0001)
+- name (string)
+- city (string)
+- age (int/float; may contain missing)
+- gender (string; may contain inconsistent casing like 'male', 'MALE', 'F')
+- purchase_amount (float; may contain outliers and missing)
+
+Your goal is to combine, clean, and analyze this customer data.
+
+Tasks
+------
+1) Generate the two CSVs synthetically and read them into Pandas.
+
+2) Concatenation:
+   - Combine both DataFrames into one `df_all` using pd.concat(ignore_index=True).
+   - Print shape before and after concat.
+
+3) Handling Duplicates:
+   - Randomly add a few duplicate rows to simulate data entry errors.
+   - Drop duplicates (keeping first) and report how many were removed.
+
+4) Missing Values:
+   - Show missing count per column.
+   - Fill missing ages with mean age (rounded).
+   - Fill missing purchase_amount with median.
+
+5) Standardize Categorical Values:
+   - Make gender uppercase and replace possible short forms:
+       M, MALE → 'MALE'
+       F, FEMALE → 'FEMALE'
+   - Strip leading/trailing spaces in name and city.
+
+6) Outliers:
+   - For purchase_amount, mark outliers using IQR rule:
+       Lower = Q1 - 1.5*IQR, Upper = Q3 + 1.5*IQR
+   - Count how many outliers.
+   - Replace outlier purchase_amounts with the median.
+
+7) Descriptive Statistics:
+   - Mean, Median, Min, Max of purchase_amount.
+   - Group by gender and show average purchase_amount and average age.
+
+8) Saving:
+   - Cleaned dataset → ./artifacts/customers_clean.csv
+   - Grouped stats → ./artifacts/gender_summary.csv
+
+Run:
+    python pandas_004_customers_cleanup.py
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+
+# -----------------------------
+# Data Generation
+# -----------------------------
+def generate_customer_data(seed: int = 55) -> None:
+    rng = np.random.default_rng(seed)
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    def branch_data(branch_name: str, n: int) -> pd.DataFrame:
+        cities = ["Kanpur", "Lucknow", "Delhi", "Noida", "Agra", "Varanasi"]
+        genders = ["M", "F", "male", "female", "MALE", "FEMALE"]
+        names_first = ["Aarav", "Vivaan", "Diya", "Riya", "Kunal", "Arjun", "Tara", "Sara", "Kabir", "Om"]
+        names_last = ["Sharma", "Gupta", "Verma", "Yadav", "Khan", "Patel", "Singh", "Mishra", "Tiwari", "Agarwal"]
+
+        df = pd.DataFrame({
+            "cust_id": [f"C{branch_name[0]}{i:03d}" for i in range(1, n + 1)],
+            "name": [f"{rng.choice(names_first)} {rng.choice(names_last)}" for _ in range(n)],
+            "city": rng.choice(cities, size=n),
+            "age": rng.normal(32, 8, size=n).round(1),
+            "gender": rng.choice(genders, size=n),
+            "purchase_amount": rng.normal(4500, 1200, size=n).round(2)
+        })
+        # Add missing values
+        miss_age = rng.random(n) < 0.05
+        miss_amt = rng.random(n) < 0.07
+        df.loc[miss_age, "age"] = np.nan
+        df.loc[miss_amt, "purchase_amount"] = np.nan
+        return df
+
+    branchA = branch_data("A", 60)
+    branchB = branch_data("B", 55)
+
+    branchA.to_csv(data_dir / "customers_branchA.csv", index=False)
+    branchB.to_csv(data_dir / "customers_branchB.csv", index=False)
+    print("Generated customers_branchA.csv and customers_branchB.csv in ./data/")
+
+
+# -----------------------------
+# Solution
+# -----------------------------
+def main() -> None:
+    data_dir = Path("data")
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    if not (data_dir / "customers_branchA.csv").exists():
+        generate_customer_data()
+
+    # 1) Load
+    a = pd.read_csv(data_dir / "customers_branchA.csv")
+    b = pd.read_csv(data_dir / "customers_branchB.csv")
+    print("\n=== 1) DATA LOADED ===")
+    print("Branch A shape:", a.shape, "Branch B shape:", b.shape)
+
+    # 2) Concatenate
+    df_all = pd.concat([a, b], ignore_index=True)
+    print("\nAfter concat shape:", df_all.shape)
+
+    # Add intentional duplicates
+    dup_sample = df_all.sample(5, random_state=1)
+    df_all = pd.concat([df_all, dup_sample], ignore_index=True)
+    before = df_all.shape[0]
+    df_all = df_all.drop_duplicates(keep="first")
+    after = df_all.shape[0]
+    print(f"Duplicates removed: {before - after}")
+
+    # 3) Missing Values
+    print("\n=== 3) MISSING VALUES ===")
+    print(df_all.isna().sum())
+
+    df_all["age"] = df_all["age"].fillna(round(df_all["age"].mean(), 1))
+    df_all["purchase_amount"] = df_all["purchase_amount"].fillna(df_all["purchase_amount"].median())
+
+    # 4) Standardize Categorical
+    print("\n=== 4) CLEANING TEXT / GENDER ===")
+    df_all["gender"] = (
+        df_all["gender"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"M": "MALE", "F": "FEMALE"})
+    )
+    df_all["name"] = df_all["name"].astype(str).str.strip()
+    df_all["city"] = df_all["city"].astype(str).str.strip()
+
+    # 5) Outlier handling
+    print("\n=== 5) OUTLIERS ===")
+    q1, q3 = df_all["purchase_amount"].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+    outlier_mask = (df_all["purchase_amount"] < lower) | (df_all["purchase_amount"] > upper)
+    outliers_count = outlier_mask.sum()
+    print(f"Outliers detected: {outliers_count}")
+    median_val = df_all["purchase_amount"].median()
+    df_all.loc[outlier_mask, "purchase_amount"] = median_val
+
+    # 6) Stats
+    print("\n=== 6) DESCRIPTIVE STATISTICS ===")
+    desc = df_all["purchase_amount"].agg(["mean", "median", "min", "max"]).round(2)
+    print(desc)
+
+    gender_summary = (
+        df_all.groupby("gender", as_index=False)
+        .agg(avg_purchase=("purchase_amount", "mean"), avg_age=("age", "mean"))
+        .round(2)
+    )
+    print("\nAverage by gender:\n", gender_summary.to_string(index=False))
+
+    # 7) Save
+    df_all.to_csv(artifacts / "customers_clean.csv", index=False)
+    gender_summary.to_csv(artifacts / "gender_summary.csv", index=False)
+
+    print("\nSaved cleaned and summary files to ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
