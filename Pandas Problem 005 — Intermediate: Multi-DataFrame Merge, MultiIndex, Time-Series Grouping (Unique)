@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 005 — Intermediate: Multi-DataFrame Merge, MultiIndex, Time-Series Grouping (Unique)
+
+Scenario:
+You work with an e-commerce dataset split across multiple tables:
+- orders: order_id, order_date, customer_id, product_id, qty, price
+- customers: customer_id, name, city, signup_date
+- products: product_id, product_name, category, launch_date
+- returns: return_id, order_id, return_date, qty_returned
+
+Goals / Tasks (INTERMEDIATE)
+1) Generate synthetic tables (orders, customers, products, returns) and save as CSV (data/).
+   - orders span ~10 months with daily timestamps.
+   - include some orders that reference a product not in products (to test left/right joins).
+   - include partial returns for some orders.
+
+2) Load all tables into DataFrames and ensure proper dtypes (parse dates).
+
+3) Merge chain:
+   - Merge orders <- customers (left join on customer_id) to get customer info.
+   - Merge result <- products (left join on product_id) — keep track of merge indicators.
+   - After merges, report how many orders lost product metadata (i.e., product_name is null).
+
+4) Compute per-order columns:
+   - order_revenue = qty * price
+   - net_qty = qty - qty_returned (treat missing returns as 0)
+   - net_revenue = net_qty * price
+   Save this to `orders_enriched`.
+
+5) Time-series grouping:
+   - Resample or group by month (order_date -> MonthStart) and compute:
+      a) monthly total gross revenue (sum of order_revenue)
+      b) monthly total net revenue (sum of net_revenue)
+      c) monthly unique_customers (nunique of customer_id)
+      d) monthly top 3 products by net_revenue (for each month)
+
+6) MultiIndex pivot:
+   - Create a MultiIndex pivot table with index = [month, category], columns = top channels of metric:
+       values = net_revenue aggregated by sum.
+     (Hint: first compute month & category grouping, then unstack or pivot to get MultiIndex behavior.)
+
+7) MultiIndex manipulations:
+   - Convert the pivot to a DataFrame with a MultiIndex on rows (month, category) and a single "net_revenue" column.
+   - Then reset index and sort by month asc, net_revenue desc.
+
+8) Advanced groupby (intermediate):
+   - For each product, compute lifetime metrics:
+       - total_orders, total_qty, total_net_qty, total_gross_revenue, total_net_revenue, first_order_date, last_order_date
+     Save as `product_lifetime_summary.csv`.
+
+9) Save artifacts:
+   - artifacts/orders_enriched.csv
+   - artifacts/monthly_summary.csv
+   - artifacts/monthly_top_products.csv
+   - artifacts/product_lifetime_summary.csv
+   - artifacts/month_category_pivot.csv
+
+10) Print concise samples for each major result.
+
+This problem enforces careful merges, handling missing returns, date grouping, and MultiIndex pivoting.
+"""
+
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import timedelta
+
+# -----------------------------
+# Data generation (synthetic)
+# -----------------------------
+def generate_data(seed: int = 123):
+    rng = np.random.default_rng(seed)
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Customers
+    n_customers = 450
+    cust_ids = [f"C{str(i).zfill(4)}" for i in range(1, n_customers + 1)]
+    cities = ["Kanpur", "Lucknow", "Delhi", "Noida", "Agra", "Varanasi"]
+    signup_dates = pd.date_range("2024-01-01", periods=300).to_list()
+    customers = pd.DataFrame({
+        "customer_id": cust_ids,
+        "name": [f"User_{i}" for i in range(1, n_customers + 1)],
+        "city": rng.choice(cities, size=n_customers, p=[0.25,0.2,0.25,0.15,0.1,0.05]),
+        "signup_date": rng.choice(signup_dates, size=n_customers)
+    })
+    customers.to_csv(data_dir / "customers.csv", index=False)
+
+    # Products
+    product_ids = np.arange(200, 230)  # 30 products
+    prod_names = [f"P_{i}" for i in product_ids]
+    categories = ["Electronics", "Accessories", "Home", "Kitchen"]
+    launch_dates = pd.date_range("2023-06-01", periods=180).to_list()
+    products = pd.DataFrame({
+        "product_id": product_ids,
+        "product_name": prod_names,
+        "category": rng.choice(categories, size=len(product_ids), p=[0.4,0.25,0.2,0.15]),
+        "launch_date": rng.choice(launch_dates, size=len(product_ids))
+    })
+    products.to_csv(data_dir / "products.csv", index=False)
+
+    # Orders (10 months)
+    start = pd.Timestamp("2024-03-01")
+    days = (pd.Timestamp("2024-12-01") - start).days + 1
+    date_range = pd.date_range(start, periods=days, freq="D")
+    n_orders = 3200
+    order_ids = np.arange(10000, 10000 + n_orders)
+    order_dates = rng.choice(date_range, size=n_orders)
+    order_customer = rng.choice(customers["customer_id"], size=n_orders)
+    # include some product_ids that do not exist to test merge misses
+    product_pool = np.concatenate([products["product_id"].values, np.array([999, 998, 997])])
+    order_products = rng.choice(product_pool, size=n_orders, p=None)
+    qty = rng.integers(1, 5, size=n_orders)
+    price = (rng.normal(1200, 350, size=n_orders)).round(2).clip(99, 5000)
+
+    orders = pd.DataFrame({
+        "order_id": order_ids,
+        "order_date": pd.to_datetime(order_dates),
+        "customer_id": order_customer,
+        "product_id": order_products,
+        "qty": qty,
+        "price": price
+    })
+    orders.to_csv(data_dir / "orders.csv", index=False)
+
+    # Returns: partial returns for ~8% of orders
+    n_returns = int(n_orders * 0.08)
+    ret_order_sample = rng.choice(orders["order_id"], size=n_returns, replace=False)
+    return_rows = []
+    for i, oid in enumerate(ret_order_sample, start=1):
+        ord_row = orders.loc[orders["order_id"] == oid].iloc[0]
+        max_ret = int(ord_row["qty"])
+        if max_ret <= 0:
+            continue
+        ret_qty = rng.integers(1, max_ret + 1)
+        ret_date = ord_row["order_date"] + pd.Timedelta(days=int(rng.integers(1, 14)))
+        return_rows.append({
+            "return_id": 5000 + i,
+            "order_id": oid,
+            "return_date": ret_date,
+            "qty_returned": ret_qty
+        })
+    returns = pd.DataFrame(return_rows)
+    returns.to_csv(data_dir / "returns.csv", index=False)
+
+    print("Generated data in ./data/: customers.csv, products.csv, orders.csv, returns.csv")
+
+
+# -----------------------------
+# Solutions / Pipeline
+# -----------------------------
+def load_data():
+    data_dir = Path("data")
+    orders = pd.read_csv(data_dir / "orders.csv", parse_dates=["order_date"])
+    customers = pd.read_csv(data_dir / "customers.csv", parse_dates=["signup_date"])
+    products = pd.read_csv(data_dir / "products.csv", parse_dates=["launch_date"])
+    returns = pd.read_csv(data_dir / "returns.csv", parse_dates=["return_date"]) if (data_dir / "returns.csv").exists() else pd.DataFrame(columns=["return_id","order_id","return_date","qty_returned"])
+    return orders, customers, products, returns
+
+
+def merge_and_enrich(orders, customers, products, returns):
+    # Merge customers (left)
+    o_c = orders.merge(customers, on="customer_id", how="left", indicator="cust_merge")
+    # Merge products (left) and keep indicator
+    o_c_p = o_c.merge(products, on="product_id", how="left", indicator="prod_merge")
+
+    # How many orders lost product metadata?
+    missing_products = o_c_p["product_name"].isna().sum()
+
+    # Join returns: aggregate returns per order (some orders may have multiple return records)
+    if not returns.empty:
+        returns_agg = returns.groupby("order_id", as_index=False)["qty_returned"].sum()
+    else:
+        returns_agg = pd.DataFrame(columns=["order_id", "qty_returned"])
+
+    enriched = o_c_p.merge(returns_agg, left_on="order_id", right_on="order_id", how="left")
+    enriched["qty_returned"] = enriched["qty_returned"].fillna(0).astype(int)
+
+    # compute revenue columns
+    enriched["order_revenue"] = (enriched["qty"] * enriched["price"]).round(2)
+    enriched["net_qty"] = (enriched["qty"] - enriched["qty_returned"]).clip(lower=0)
+    enriched["net_revenue"] = (enriched["net_qty"] * enriched["price"]).round(2)
+
+    return enriched, missing_products
+
+
+def monthly_summary(enriched):
+    # month as Period start (MonthStart)
+    enriched["month"] = enriched["order_date"].dt.to_period("M").dt.to_timestamp()
+    # a) monthly totals
+    monthly = (
+        enriched.groupby("month")
+        .agg(
+            gross_revenue=("order_revenue", "sum"),
+            net_revenue=("net_revenue", "sum"),
+            unique_customers=("customer_id", lambda s: s.nunique()),
+            total_orders=("order_id", "nunique")
+        )
+        .reset_index()
+        .sort_values("month")
+    )
+
+    # b) monthly top 3 products by net_revenue
+    prod_month = (
+        enriched.groupby(["month", "product_id", "product_name"], dropna=False)
+        .agg(net_revenue=("net_revenue", "sum"))
+        .reset_index()
+    )
+    # For products missing product_name, keep product_id for traceability
+    top_products = (
+        prod_month.sort_values(["month", "net_revenue"], ascending=[True, False])
+        .groupby("month")
+        .head(3)
+        .reset_index(drop=True)
+    )
+
+    return monthly, top_products
+
+
+def month_category_pivot(enriched):
+    # Ensure category exists (fill unknown)
+    enriched["category"] = enriched["category"].fillna("Unknown")
+    month_cat = (
+        enriched.groupby([enriched["order_date"].dt.to_period("M").dt.to_timestamp(), "category"], as_index=False)
+        .agg(net_revenue=("net_revenue", "sum"))
+    )
+    month_cat = month_cat.rename(columns={"order_date": "month"})
+    # Pivot: rows (month, category) -> keep as MultiIndex by setting index then unstacking optional
+    pivot = month_cat.set_index(["order_date", "category"]) if "order_date" in month_cat.columns else month_cat.set_index(["month", "category"])
+    # For clarity create a DataFrame with MultiIndex rows and one column net_revenue
+    if "net_revenue" not in pivot.columns:
+        pivot = month_cat.set_index(["month", "category"])
+    else:
+        pivot = pivot
+    pivot = pivot[["net_revenue"]].sort_index()
+    # Reset index to standardize file output later
+    pivot_reset = pivot.reset_index()
+    return pivot_reset
+
+
+def product_lifetime_summary(enriched):
+    prod_life = (
+        enriched.groupby(["product_id", "product_name"], dropna=False)
+        .agg(
+            total_orders=("order_id", "nunique"),
+            total_qty=("qty", "sum"),
+            total_net_qty=("net_qty", "sum"),
+            total_gross_revenue=("order_revenue", "sum"),
+            total_net_revenue=("net_revenue", "sum"),
+            first_order_date=("order_date", "min"),
+            last_order_date=("order_date", "max")
+        )
+        .reset_index()
+        .sort_values("total_net_revenue", ascending=False)
+    )
+    return prod_life
+
+
+# -----------------------------
+# Runner
+# -----------------------------
+def main():
+    data_dir = Path("data")
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    if not (data_dir / "orders.csv").exists():
+        generate_data()
+
+    orders, customers, products, returns = load_data()
+
+    print("Loaded tables:")
+    print("orders:", orders.shape, "customers:", customers.shape, "products:", products.shape, "returns:", returns.shape)
+
+    enriched, missing_products = merge_and_enrich(orders, customers, products, returns)
+    print(f"\nAfter merging, orders with missing product metadata: {missing_products}")
+    print("Sample enriched rows (head):")
+    print(enriched.head(6).to_string(index=False))
+
+    monthly, top_products = monthly_summary(enriched)
+    print("\nMonthly summary (head):")
+    print(monthly.head(6).to_string(index=False))
+
+    print("\nMonthly top products (sample):")
+    print(top_products.head(10).to_string(index=False))
+
+    pivot_reset = month_category_pivot(enriched)
+    print("\nMonth-Category pivot (sample rows):")
+    print(pivot_reset.head(8).to_string(index=False))
+
+    prod_life = product_lifetime_summary(enriched)
+    print("\nProduct lifetime summary (top 8 by net revenue):")
+    print(prod_life.head(8).to_string(index=False))
+
+    # Save artifacts
+    enriched.to_csv(artifacts / "orders_enriched.csv", index=False)
+    monthly.to_csv(artifacts / "monthly_summary.csv", index=False)
+    top_products.to_csv(artifacts / "monthly_top_products.csv", index=False)
+    pivot_reset.to_csv(artifacts / "month_category_pivot.csv", index=False)
+    prod_life.to_csv(artifacts / "product_lifetime_summary.csv", index=False)
+
+    # Quick sanity checks
+    assert "net_revenue" in enriched.columns
+    assert monthly["gross_revenue"].notna().all()
+
+    print("\nArtifacts saved to ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
