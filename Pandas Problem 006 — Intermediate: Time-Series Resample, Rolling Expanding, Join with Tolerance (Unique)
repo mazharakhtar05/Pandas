@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 006 — Intermediate: Time-Series Resample, Rolling/Expanding, Join with Tolerance (Unique)
+
+Scenario
+--------
+You operate an analytics pipeline with three streams:
+1) web_events: minute-level traffic telemetry
+   - ts (datetime, minute resolution)
+   - user_id (str like U00001)
+   - pageviews (int)
+   - sessions (int; mostly 0/1)
+   - channel (categorical: Direct/SEO/Ads/Referral)
+
+2) ad_impressions: ad delivery events
+   - ts (datetime, second resolution)
+   - user_id
+   - campaign (A/B/C)
+   - imp_id (unique)
+
+3) ad_clicks: clicks that may or may not relate to an impression shortly before
+   - ts (datetime, second resolution)
+   - user_id
+   - campaign
+   - click_id
+
+Goals / Tasks (INTERMEDIATE)
+----------------------------
+A) Generate synthetic datasets for ~30 days.
+
+B) Time Resampling (web_events):
+   1) Hourly summary: pageviews, sessions (sum); unique users (nunique) per hour.
+   2) Daily summary: pageviews, sessions (sum); unique users per day.
+
+C) Rolling & Expanding:
+   3) On hourly summary:
+      - rolling_24h_pageviews: 24-hour rolling sum (window=24, min_periods=1).
+      - rolling_24h_sessions: 24-hour rolling sum.
+      - z_pageviews_24h: z-score using rolling mean/std over 24 hours (flag anomalies).
+   4) On daily summary:
+      - expanding_avg_sessions: expanding mean of sessions (from start).
+      - rolling_7d_pv_avg: 7-day rolling mean of pageviews (min_periods=1).
+
+D) Join with Tolerance (Attribution):
+   5) Attribute each CLICK to the most recent IMPRESSION for same user_id+campaign within 30 minutes.
+      Use pd.merge_asof with:
+        - left = clicks (sorted by ts),
+        - right = impressions (sorted by ts),
+        - by = ["user_id", "campaign"],
+        - direction = "backward",
+        - tolerance = "30min".
+      Compute:
+        - attributed (bool), impression_age_sec, and per-campaign CTR:
+            CTR = #attributed_clicks / #impressions
+
+E) Save artifacts:
+   - artifacts/hourly_summary.csv
+   - artifacts/daily_summary.csv
+   - artifacts/hourly_with_rolling.csv
+   - artifacts/daily_with_windows.csv
+   - artifacts/campaign_ctr.csv
+   - artifacts/click_attribution_sample.csv
+   - artifacts/anomalies_24h.csv
+
+Print concise samples of each major output.
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------
+# Data Generation
+# -----------------------------
+def generate_data(seed: int = 202) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(seed)
+
+    # Timeline (~30 days, minute-level for web_events; second-level for ads)
+    start = pd.Timestamp("2024-10-01 00:00:00")
+    end = start + pd.Timedelta(days=30) - pd.Timedelta(minutes=1)
+
+    minutes = pd.date_range(start, end, freq="min")
+    n_minutes = len(minutes)
+
+    users = [f"U{str(i).zfill(5)}" for i in range(1, 2501)]  # 2.5k users
+    channels = ["Direct", "SEO", "Ads", "Referral"]
+    channel_p = [0.28, 0.34, 0.22, 0.16]
+
+    # Simulate web_events (sparse per minute)
+    # baseline PV per minute with diurnal seasonality
+    hour = minutes.hour
+    base_rate = 0.3 + 0.7 * np.sin((hour / 24) * 2 * np.pi) ** 2  # more PV in the day
+    pv = np.random.poisson(lam=np.clip(base_rate * 5, 0.1, 10))  # base PV per minute
+
+    rows = []
+    for i, ts in enumerate(minutes):
+        # sample how many events to record this minute
+        k = pv[i]
+        if k == 0:
+            continue
+        chosen_users = np.random.choice(users, size=k, replace=False)
+        chosen_channels = np.random.choice(channels, size=k, p=channel_p)
+        # sessions ~ 20% chance in a minute event
+        sess = np.random.binomial(1, 0.2, size=k)
+        # per-event pageviews 1..4
+        pvs = np.random.choice([1, 2, 3, 4], size=k, p=[0.55, 0.3, 0.1, 0.05])
+        for u, ch, s, v in zip(chosen_users, chosen_channels, sess, pvs):
+            rows.append((ts, u, int(v), int(s), ch))
+
+    web_events = pd.DataFrame(rows, columns=["ts", "user_id", "pageviews", "sessions", "channel"])
+
+    # Ad impressions and clicks
+    campaigns = ["A", "B", "C"]
+    # generate impression timestamps across the same window
+    n_imps = 60_00  # 6k impressions
+    imp_ts = start + pd.to_timedelta(np.random.uniform(0, (end - start).total_seconds(), n_imps), unit="s")
+    imp_users = np.random.choice(users, size=n_imps)
+    imp_campaign = np.random.choice(campaigns, size=n_imps, p=[0.45, 0.35, 0.20])
+    ad_impressions = pd.DataFrame({
+        "ts": pd.to_datetime(imp_ts).round("1s"),
+        "user_id": imp_users,
+        "campaign": imp_campaign,
+        "imp_id": np.arange(100000, 100000 + n_imps),
+    }).sort_values("ts").reset_index(drop=True)
+
+    # clicks: sample subset; most happen within 5–20 minutes after an impression, plus some orphan clicks
+    click_rows = []
+    click_prob = {"A": 0.06, "B": 0.045, "C": 0.035}
+    for camp in campaigns:
+        camp_imps = ad_impressions[ad_impressions["campaign"] == camp]
+        n_clicks = int(len(camp_imps) * click_prob[camp])
+        # choose a subset to click
+        chosen = camp_imps.sample(n_clicks, random_state=camp_imps.shape[0] % 97)
+        # delay ~ 1–25 minutes
+        delays = np.random.randint(60, 25 * 60, size=n_clicks)
+        clicks_ts = (chosen["ts"] + pd.to_timedelta(delays, unit="s")).values
+        click_rows.append(pd.DataFrame({
+            "ts": pd.to_datetime(clicks_ts).round("1s"),
+            "user_id": chosen["user_id"].values,
+            "campaign": camp,
+            "click_id": np.arange(500000 + len(pd.concat(click_rows)) if click_rows else 500000,
+                                  500000 + len(pd.concat(click_rows)) + n_clicks if click_rows else 500000 + n_clicks)
+        }))
+    ad_clicks = pd.concat(click_rows, ignore_index=True)
+
+    # add some orphan clicks (no preceding impression within 30 min or mismatched user)
+    orphan_n = 250
+    orphan_ts = start + pd.to_timedelta(np.random.uniform(0, (end - start).total_seconds(), orphan_n), unit="s")
+    orphan_users = np.random.choice(users, size=orphan_n)
+    orphan_campaigns = np.random.choice(campaigns, size=orphan_n)
+    orphans = pd.DataFrame({
+        "ts": pd.to_datetime(orphan_ts).round("1s"),
+        "user_id": orphan_users,
+        "campaign": orphan_campaigns,
+        "click_id": np.arange(900000, 900000 + orphan_n)
+    })
+    ad_clicks = pd.concat([ad_clicks, orphans], ignore_index=True).sort_values("ts").reset_index(drop=True)
+
+    return web_events, ad_impressions, ad_clicks
+
+
+# -----------------------------
+# Solutions
+# -----------------------------
+def build_time_summaries(web_events: pd.DataFrame):
+    # Hourly
+    web_events = web_events.copy()
+    web_events["hour"] = web_events["ts"].dt.floor("H")
+    hourly = (web_events
+              .groupby("hour")
+              .agg(pageviews=("pageviews", "sum"),
+                   sessions=("sessions", "sum"),
+                   unique_users=("user_id", "nunique"))
+              .reset_index()
+              .sort_values("hour"))
+
+    # Daily
+    web_events["day"] = web_events["ts"].dt.date
+    daily = (web_events
+             .groupby("day")
+             .agg(pageviews=("pageviews", "sum"),
+                  sessions=("sessions", "sum"),
+                  unique_users=("user_id", "nunique"))
+             .reset_index())
+    daily["day"] = pd.to_datetime(daily["day"])
+    daily = daily.sort_values("day")
+    return hourly, daily
+
+
+def add_hourly_rolling(hourly: pd.DataFrame) -> pd.DataFrame:
+    df = hourly.copy()
+    df = df.sort_values("hour")
+    # 24-hour rolling sums
+    df["rolling_24h_pageviews"] = df["pageviews"].rolling(window=24, min_periods=1).sum()
+    df["rolling_24h_sessions"] = df["sessions"].rolling(window=24, min_periods=1).sum()
+    # rolling mean/std for z-score
+    roll_mean = df["pageviews"].rolling(window=24, min_periods=6).mean()
+    roll_std = df["pageviews"].rolling(window=24, min_periods=6).std()
+    df["z_pageviews_24h"] = (df["pageviews"] - roll_mean) / roll_std
+    # anomalies where |z| >= 3 and std not nan/0
+    df["is_anomaly"] = df["z_pageviews_24h"].abs() >= 3
+    return df
+
+
+def add_daily_windows(daily: pd.DataFrame) -> pd.DataFrame:
+    d = daily.copy().sort_values("day")
+    d["rolling_7d_pv_avg"] = d["pageviews"].rolling(window=7, min_periods=1).mean()
+    d["expanding_avg_sessions"] = d["sessions"].expanding(min_periods=1).mean()
+    return d
+
+
+def attribute_clicks(imps: pd.DataFrame, clicks: pd.DataFrame):
+    # Sort for merge_asof
+    imps_s = imps.sort_values("ts")
+    clicks_s = clicks.sort_values("ts")
+
+    # asof join by user+campaign within 30 minutes backward (nearest previous impression)
+    attributed = pd.merge_asof(
+        clicks_s, imps_s,
+        on="ts",
+        by=["user_id", "campaign"],
+        direction="backward",
+        tolerance=pd.Timedelta("30min"),
+        suffixes=("_click", "_imp")
+    )
+
+    attributed["attributed"] = attributed["imp_id"].notna()
+    # age in seconds between click and matched impression
+    attributed["impression_age_sec"] = (attributed["ts"] - attributed["ts"]).dt.total_seconds()  # placeholder
+    # Fix: we merged on 'ts', so both columns named 'ts'; preserve before merge:
+    # We'll recompute with a second merge that keeps both timestamps
+    clicks_s2 = clicks_s.rename(columns={"ts": "ts_click"})
+    imps_s2 = imps_s.rename(columns={"ts": "ts_imp"})
+    attributed2 = pd.merge_asof(
+        clicks_s2, imps_s2,
+        left_on="ts_click", right_on="ts_imp",
+        by=["user_id", "campaign"],
+        direction="backward",
+        tolerance=pd.Timedelta("30min"),
+        suffixes=("", "")
+    )
+    attributed2["attributed"] = attributed2["imp_id"].notna()
+    attributed2["impression_age_sec"] = (attributed2["ts_click"] - attributed2["ts_imp"]).dt.total_seconds()
+
+    # CTR per campaign = attributed_clicks / impressions
+    clicks_campaign = attributed2.groupby("campaign", as_index=False)["attributed"].sum().rename(columns={"attributed": "attributed_clicks"})
+    imp_campaign = imps.groupby("campaign", as_index=False).size().rename(columns={"size": "impressions"})
+
+    ctr = pd.merge(imp_campaign, clicks_campaign, on="campaign", how="left").fillna({"attributed_clicks": 0})
+    ctr["ctr"] = (ctr["attributed_clicks"] / ctr["impressions"]).round(4)
+
+    return attributed2, ctr
+
+
+# -----------------------------
+# Runner
+# -----------------------------
+def main():
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
+    print("Generating synthetic data...")
+    web_events, ad_impressions, ad_clicks = generate_data()
+
+    print(f"web_events rows: {len(web_events)} | impressions: {len(ad_impressions)} | clicks: {len(ad_clicks)}")
+
+    # B) Resampling summaries
+    hourly, daily = build_time_summaries(web_events)
+
+    # C) Windows
+    hourly_w = add_hourly_rolling(hourly)
+    daily_w = add_daily_windows(daily)
+
+    # D) Attribution via merge_asof with tolerance
+    attributed_clicks_df, campaign_ctr = attribute_clicks(ad_impressions, ad_clicks)
+
+    # Anomalies table (subset)
+    anomalies = hourly_w.loc[hourly_w["is_anomaly"] & hourly_w["z_pageviews_24h"].notna(),
+                             ["hour", "pageviews", "z_pageviews_24h"]].copy()
+
+    # Print samples
+    print("\n=== Hourly summary (head) ===")
+    print(hourly.head(6).to_string(index=False))
+    print("\n=== Hourly with rolling/z (tail 6) ===")
+    print(hourly_w.tail(6).to_string(index=False))
+    print("\n=== Daily with windows (head) ===")
+    print(daily_w.head(10).to_string(index=False))
+    print("\n=== Campaign CTR ===")
+    print(campaign_ctr.to_string(index=False))
+    print("\n=== Click attribution sample ===")
+    print(attributed_clicks_df.head(10)[["ts_click","user_id","campaign","ts_imp","imp_id","attributed","impression_age_sec"]].to_string(index=False))
+    if not anomalies.empty:
+        print("\n=== 24h Anomalies (sample) ===")
+        print(anomalies.head(10).to_string(index=False))
+    else:
+        print("\n(No anomalies detected with |z| >= 3 in this simulation.)")
+
+    # Save artifacts
+    hourly.to_csv(artifacts / "hourly_summary.csv", index=False)
+    daily.to_csv(artifacts / "daily_summary.csv", index=False)
+    hourly_w.to_csv(artifacts / "hourly_with_rolling.csv", index=False)
+    daily_w.to_csv(artifacts / "daily_with_windows.csv", index=False)
+    campaign_ctr.to_csv(artifacts / "campaign_ctr.csv", index=False)
+    attributed_clicks_df.sample(min(200, len(attributed_clicks_df)), random_state=7)\
+        .to_csv(artifacts / "click_attribution_sample.csv", index=False)
+    anomalies.to_csv(artifacts / "anomalies_24h.csv", index=False)
+
+    # Basic sanity checks
+    assert {"rolling_24h_pageviews", "z_pageviews_24h"}.issubset(hourly_w.columns)
+    assert {"rolling_7d_pv_avg", "expanding_avg_sessions"}.issubset(daily_w.columns)
+    assert "ctr" in campaign_ctr.columns
+
+    print("\nSaved artifacts in ./artifacts/")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
