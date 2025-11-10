@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 007 — Tidy Reshape + Custom Aggregations (Unique, Short)
+
+Dataset (synthetic):
+- day (2024-11-01 .. 2024-11-07)
+- meal (Breakfast/Lunch/Snack/Dinner)
+- protein_g, carbs_g, fat_g, calories
+
+Tasks
+1) Convert meal to ordered categorical: Breakfast < Lunch < Snack < Dinner.
+2) Tidy reshape: melt macro columns to long -> columns: [day, meal, nutrient, grams]
+3) Per-day macro % split: for each day, each nutrient’s % of total grams.
+4) Custom groupby aggs (per meal):
+   - total_cal = sum(calories)
+   - p95_cal = 95th percentile of calories
+   - spread_cal = max - min
+5) Pivot back (per day x meal) of calories (sum). Missing -> 0.
+6) Save artifacts (./artifacts): long_macros.csv, daily_macro_share.csv, meal_cal_summary.csv, day_meal_cal_pivot.csv
+"""
+
+from __future__ import annotations
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+def make_data():
+    days = pd.date_range("2024-11-01", periods=7, freq="D")
+    meals = ["Breakfast", "Lunch", "Snack", "Dinner"]
+    rng = np.random.default_rng(77)
+    rows = []
+    for d in days:
+        for m in meals:
+            p = rng.integers(10, 45)     # protein grams
+            c = rng.integers(20, 95)     # carbs grams
+            f = rng.integers(5, 35)      # fat grams
+            kcal = int(round(p*4 + c*4 + f*9 + rng.normal(0, 30)))
+            rows.append((d, m, p, c, f, kcal))
+    return pd.DataFrame(rows, columns=["day","meal","protein_g","carbs_g","fat_g","calories"])
+
+def main():
+    df = make_data()
+
+    # 1) Ordered categorical meal
+    cat = pd.api.types.CategoricalDtype(
+        categories=["Breakfast","Lunch","Snack","Dinner"], ordered=True
+    )
+    df["meal"] = df["meal"].astype(cat)
+
+    # 2) Tidy reshape (melt)
+    long = df.melt(
+        id_vars=["day","meal","calories"],
+        value_vars=["protein_g","carbs_g","fat_g"],
+        var_name="nutrient",
+        value_name="grams"
+    ).sort_values(["day","meal","nutrient"])
+
+    # 3) Per-day macro % split
+    daily_tot = long.groupby(["day","nutrient"], as_index=False)["grams"].sum()
+    daily_tot["pct"] = (daily_tot["grams"] / daily_tot.groupby("day")["grams"].transform("sum") * 100).round(2)
+
+    # 4) Custom groupby aggs per meal
+    def p95(x): return np.percentile(x, 95)
+    meal_cal_sum = (df.groupby("meal")
+                      .agg(total_cal=("calories","sum"),
+                           p95_cal=("calories", p95),
+                           spread_cal=("calories", lambda s: s.max()-s.min()))
+                      .reset_index()
+                      .sort_values("meal"))
+
+    # 5) Pivot back (day x meal) calories
+    pivot = (df.pivot_table(index="day", columns="meal", values="calories", aggfunc="sum", fill_value=0)
+               .sort_index())
+    pivot.columns.name = None
+    pivot = pivot.reset_index()
+
+    # Show concise samples
+    print("\nLong macros (head):")
+    print(long.head(8).to_string(index=False))
+    print("\nDaily macro % split:")
+    print(daily_tot.head(9).to_string(index=False))
+    print("\nMeal calorie summary:")
+    print(meal_cal_sum.to_string(index=False))
+    print("\nDay x Meal calories pivot:")
+    print(pivot.to_string(index=False))
+
+    # 6) Save artifacts
+    out = Path("artifacts"); out.mkdir(exist_ok=True, parents=True)
+    long.to_csv(out/"long_macros.csv", index=False)
+    daily_tot.to_csv(out/"daily_macro_share.csv", index=False)
+    meal_cal_sum.to_csv(out/"meal_cal_summary.csv", index=False)
+    pivot.to_csv(out/"day_meal_cal_pivot.csv", index=False)
+    print("\nArtifacts saved to ./artifacts/")
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
