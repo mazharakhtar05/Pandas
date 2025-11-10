@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 008 — Short & Intermediate (Top-K, Ranking, Merge)
+
+Dataset (synthetic):
+- product_id
+- category
+- month
+- units_sold
+- price
+
+Tasks:
+1) Compute revenue = units_sold * price.
+2) For each category, get top-2 products by revenue.
+3) Add ranks (dense).
+4) Merge back top-2 info to original df.
+5) Summary: total revenue per category.
+
+Expected outputs printed + saved:
+- top2.csv
+- category_summary.csv
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+def make_data():
+    rng = np.random.default_rng(15)
+    rows = []
+    cats = ["Electronics","Home","Fashion"]
+    months = ["Jan","Feb","Mar"]
+    pid = 100
+    for c in cats:
+        for m in months:
+            for _ in range(8):
+                rows.append([pid,c,m,rng.integers(5,50),rng.integers(200,2000)])
+                pid+=1
+    return pd.DataFrame(rows,columns=["product_id","category","month","units_sold","price"])
+
+def main():
+    df = make_data()
+    df["revenue"] = df["units_sold"] * df["price"]
+
+    # top-2 per category
+    top2 = (df.sort_values(["category","revenue"], ascending=[True,False])
+              .groupby("category")
+              .head(2)
+              .copy())
+    # dense rank
+    top2["rank"] = top2.groupby("category")["revenue"].rank("dense", ascending=False).astype(int)
+
+    # merge back
+    merged = df.merge(top2[["product_id","rank"]], on="product_id", how="left")
+
+    # summary
+    summary = df.groupby("category", as_index=False)["revenue"].sum().rename(columns={"revenue":"total_revenue"})
+
+    # prints
+    print("\nTOP 2 per category:")
+    print(top2.to_string(index=False))
+    print("\nCategory revenue summary:")
+    print(summary.to_string(index=False))
+
+    # save
+    out = Path("artifacts"); out.mkdir(exist_ok=True, parents=True)
+    top2.to_csv(out/"top2.csv", index=False)
+    summary.to_csv(out/"category_summary.csv", index=False)
+    print("\nSaved to ./artifacts/")
+    print("Done.")
+
+if __name__=="__main__":
+    main()
