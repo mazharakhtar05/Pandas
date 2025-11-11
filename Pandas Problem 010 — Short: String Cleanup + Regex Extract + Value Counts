@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Pandas Problem 010 — Short: String Cleanup + Regex Extract + Value Counts
+
+Dataset:
+- review_id
+- text (contains noisy tags, prices like ₹499, ₹1,299, links, emojis)
+
+Tasks:
+1) Clean text:
+   - remove URLs
+   - remove emojis
+   - strip extra spaces
+2) Extract price using regex (₹ followed by digits/commas).
+3) Normalize extracted price to integer (remove commas).
+4) Show:
+   - distribution of extracted prices (value_counts)
+   - top 10 cleaned reviews
+Save:
+   prices.csv, cleaned_reviews.csv
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import re
+
+def make_data():
+    texts = [
+        "Great product! Only ₹499 😍 check https://abc.com",
+        "Worth ₹1,299 !!🔥🔥",
+        "Bought for ₹2,199, amazing deal!",
+        "No price mentioned here.",
+        "Got it at ₹799 visit http://shop.test",
+        "Paid ₹999 😎",
+        "Only ₹1,099 now!!",
+        "₹499 again?? 🤔🤔",
+        "Discounted at ₹3,499!",
+        "Totally free 😂😂"
+    ]
+    df = pd.DataFrame({
+        "review_id": range(1, len(texts)+1),
+        "text": texts
+    })
+    return df
+
+def clean_text(t):
+    t = re.sub(r"http\S+", "", t)       # remove URLs
+    t = re.sub(r"[^\w\s₹,]", "", t)     # remove emojis/symbols except ₹ and commas
+    t = re.sub(r"\s+", " ", t).strip()  # normalize spaces
+    return t
+
+def main():
+    df = make_data()
+    df["clean"] = df["text"].apply(clean_text)
+
+    # extract price
+    df["price_raw"] = df["clean"].str.extract(r"(₹[\d,]+)", expand=False)
+    df["price"] = df["price_raw"].str.replace("₹", "", regex=False).str.replace(",", "").astype(float)
+
+    print("\nExtracted prices:")
+    print(df["price"].value_counts(dropna=False).to_string())
+
+    print("\nTop 10 cleaned reviews:")
+    print(df[["review_id","clean"]].to_string(index=False))
+
+    # save
+    out = Path("artifacts"); out.mkdir(parents=True, exist_ok=True)
+    df[["review_id","price"]].to_csv(out/"prices.csv", index=False)
+    df.to_csv(out/"cleaned_reviews.csv", index=False)
+    print("\nSaved to ./artifacts/")
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
