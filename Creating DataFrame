@@ -1,0 +1,12 @@
+import pandas as pd
+
+data = {
+    "Name": ["Anshika", "Riya", "Aditya", "Kabir"],
+    "Age": [18, 20, 19, 21],
+    "City": ["Lucknow", "Delhi", "Mumbai", "Chennai"]
+}
+
+df = pd.DataFrame(data)
+
+print("✨ My First Pandas DataFrame ✨")
+print(df)
