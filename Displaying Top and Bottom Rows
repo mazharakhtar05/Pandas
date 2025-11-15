@@ -1,0 +1,14 @@
+import pandas as pd
+
+data = {
+    "Name": ["Anshika", "Riya", "Aditya", "Kabir", "Rohan", "Mehak", "Simran"],
+    "Age": [18, 20, 19, 21, 22, 20, 19],
+    "City": ["Lucknow", "Delhi", "Mumbai", "Chennai", "Noida", "Kanpur", "Agra"]
+}
+
+df = pd.DataFrame(data)
+
+print("First 3 rows of the DataFrame:")
+print(df.head(3))
+print("\nLast 2 rows of the DataFrame:")
+print(df.tail(2))
