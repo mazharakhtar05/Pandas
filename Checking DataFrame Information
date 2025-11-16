@@ -1,0 +1,13 @@
+import pandas as pd
+
+data = {
+    "Name": ["Anshika", "Riya", "Aditya", "Kabir", "Rohan"],
+    "Age": [18, 20, 19, 21, 22],
+    "City": ["Lucknow", "Delhi", "Mumbai", "Chennai", "Noida"]
+}
+
+df = pd.DataFrame(data)
+
+print("DataFrame Shape:", df.shape)
+print("\nDataFrame Info:")
+print(df.info())
